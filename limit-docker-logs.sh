@@ -47,6 +47,7 @@ MAX_SIZE="10m"
 MAX_FILE="3"
 DRY_RUN=0
 APPLY_TRUNCATE=0
+RESTART_ALL=0
 
 usage() {
     cat <<EOF
@@ -56,6 +57,7 @@ usage() {
   --max-size <大小>   单个日志文件上限，默认 10m
   --max-file <数量>   保留文件数量，默认 3
   --apply-truncate    同时清空现有日志
+  --restart-all       重启所有运行中的容器（使配置立即生效）
   --dry-run           仅预览，不实际修改
   -h, --help          显示帮助
 EOF
@@ -66,6 +68,7 @@ while [[ $# -gt 0 ]]; do
         --max-size)      MAX_SIZE="$2"; shift 2 ;;
         --max-file)      MAX_FILE="$2"; shift 2 ;;
         --apply-truncate) APPLY_TRUNCATE=1; shift ;;
+        --restart-all)   RESTART_ALL=1; shift ;;
         --dry-run)       DRY_RUN=1; shift ;;
         -h|--help)       usage; exit 0 ;;
         *) echo "未知选项: $1"; usage; exit 1 ;;
@@ -146,6 +149,20 @@ if [[ "$APPLY_TRUNCATE" == 1 ]] && [[ "$DRY_RUN" == 0 ]]; then
         echo "将截断 $COUNT 个日志文件..."
         find "$LOG_DIR" -type f -name "*-json.log" -exec truncate -s 0 {} \;
         echo "完成。重启容器后新日志轮转生效: docker restart \$(docker ps -q)"
+    fi
+fi
+
+# ── 重启所有容器 ───────────────────────────────────────────────────────────
+if [[ "$RESTART_ALL" == 1 ]] && [[ "$DRY_RUN" == 0 ]]; then
+    echo
+    RUNNING=$(docker ps -q)
+    COUNT=$(echo "$RUNNING" | wc -l)
+    if [[ "$COUNT" -eq 0 ]] || [[ "$COUNT" =~ ^\ 0$ ]]; then
+        echo "无运行中的容器，跳过重启。"
+    else
+        echo "重启 $COUNT 个容器..."
+        docker restart $RUNNING
+        echo "已完成。"
     fi
 fi
 
