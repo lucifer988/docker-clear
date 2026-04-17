@@ -1,201 +1,152 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# limit-docker-logs.sh
-# One-click script to limit Docker container log size on Debian/Ubuntu.
-# It configures /etc/docker/daemon.json with json-file log rotation:
-#   log-opts: max-size, max-file
-#
-# Usage:
-#   sudo ./limit-docker-logs.sh                # defaults: 10m * 3 files
-#   sudo ./limit-docker-logs.sh --max-size 20m --max-file 5
-#   sudo ./limit-docker-logs.sh --apply-truncate   # optional: truncate existing huge *.log
-#   sudo ./limit-docker-logs.sh --dry-run
-#
-# Notes:
-# - Applies to docker log driver "json-file". If your daemon uses journald, see tips below.
-# - Existing huge logs are not automatically reduced; use --apply-truncate carefully.
+# ── 共享函数（内嵌）─────────────────────────────────────────────────────────
+
+require_root() {
+    if [[ "${EUID:-}" -ne 0 ]]; then
+        echo "请用 root 运行: sudo $0 ..." >&2
+        exit 1
+    fi
+}
+
+stat_size() {
+    local f="$1"
+    stat -c%s "$f" 2>/dev/null && return
+    stat -f%z "$f" 2>/dev/null && return
+    echo 0
+}
+
+human_size() {
+    local bytes="${1:-0}"
+    local mb gb
+    mb=$(awk "BEGIN {printf \"%.2f\", $bytes/1024/1024}")
+    gb=$(awk "BEGIN {printf \"%.2f\", $bytes/1024/1024/1024}")
+    if [[ $bytes -gt 1073741824 ]]; then
+        echo "${gb} GB"
+    else
+        echo "${mb} MB"
+    fi
+}
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || { echo "缺少 $1，请先安装。" >&2; exit 1; }
+}
+
+check_docker() {
+    need_cmd docker
+    docker info >/dev/null 2>&1 || { echo "Docker 未运行。" >&2; exit 1; }
+}
+
+# ── 主逻辑 ──────────────────────────────────────────────────────────────────
+
+DAEMON_JSON="/etc/docker/daemon.json"
+BACKUP_DIR="/etc/docker/backup-daemon-json"
 
 MAX_SIZE="10m"
 MAX_FILE="3"
-APPLY_TRUNCATE="0"
-DRY_RUN="0"
+DRY_RUN=0
+APPLY_TRUNCATE=0
 
-print_help() {
-  cat <<EOF
-Docker log limiter (Debian/Ubuntu)
+usage() {
+    cat <<EOF
+用法: sudo $0 [选项]
 
-Options:
-  --max-size <size>     e.g. 10m, 50m, 200m (default: ${MAX_SIZE})
-  --max-file <num>      number of rotated files kept (default: ${MAX_FILE})
-  --apply-truncate      truncate existing container json logs to 0 (optional, careful!)
-  --dry-run             show what would change but do nothing
-  -h, --help            show help
-
-Examples:
-  sudo ./limit-docker-logs.sh
-  sudo ./limit-docker-logs.sh --max-size 20m --max-file 5
-  sudo ./limit-docker-logs.sh --apply-truncate
+选项:
+  --max-size <大小>   单个日志文件上限，默认 10m
+  --max-file <数量>   保留文件数量，默认 3
+  --apply-truncate    同时清空现有日志
+  --dry-run           仅预览，不实际修改
+  -h, --help          显示帮助
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --max-size)
-      MAX_SIZE="${2:-}"; shift 2;;
-    --max-file)
-      MAX_FILE="${2:-}"; shift 2;;
-    --apply-truncate)
-      APPLY_TRUNCATE="1"; shift 1;;
-    --dry-run)
-      DRY_RUN="1"; shift 1;;
-    -h|--help)
-      print_help; exit 0;;
-    *)
-      echo "Unknown option: $1" >&2
-      print_help
-      exit 1;;
-  esac
+    case "$1" in
+        --max-size)      MAX_SIZE="$2"; shift 2 ;;
+        --max-file)      MAX_FILE="$2"; shift 2 ;;
+        --apply-truncate) APPLY_TRUNCATE=1; shift ;;
+        --dry-run)       DRY_RUN=1; shift ;;
+        -h|--help)       usage; exit 0 ;;
+        *) echo "未知选项: $1"; usage; exit 1 ;;
+    esac
 done
 
-if [[ "${EUID}" -ne 0 ]]; then
-  echo "Please run as root: sudo $0 ..." >&2
-  exit 1
+require_root
+check_docker
+
+# 校验参数
+if [[ ! "$MAX_SIZE" =~ ^[0-9]+[kKmMgG]$ ]]; then
+    echo "max-size 格式错误，示例: 10m, 200m, 1g" >&2; exit 1
+fi
+if [[ ! "$MAX_FILE" =~ ^[0-9]+$ ]] || [[ "$MAX_FILE" -lt 1 ]]; then
+    echo "max-file 必须为 >= 1 的整数" >&2; exit 1
 fi
 
-if ! command -v docker >/dev/null 2>&1; then
-  echo "Docker command not found. Install Docker first." >&2
-  exit 1
+echo "目标: max-size=$MAX_SIZE, max-file=$MAX_FILE"
+[[ "$DRY_RUN" == 1 ]] && echo "[预览模式]"
+
+# ── 备份 ────────────────────────────────────────────────────────────────────
+mkdir -p "$BACKUP_DIR"
+if [[ -f "$DAEMON_JSON" ]]; then
+    TS=$(date +%Y%m%d-%H%M%S)
+    if [[ "$DRY_RUN" == 0 ]]; then
+        cp -a "$DAEMON_JSON" "${BACKUP_DIR}/daemon.json.${TS}.bak"
+    fi
+    echo "已备份到: ${BACKUP_DIR}/daemon.json.${TS}.bak"
 fi
 
-# Basic validation
-if [[ ! "${MAX_SIZE}" =~ ^[0-9]+[kKmMgG]$ ]]; then
-  echo "Invalid --max-size '${MAX_SIZE}'. Use like 10m, 200m, 1g." >&2
-  exit 1
-fi
-if [[ ! "${MAX_FILE}" =~ ^[0-9]+$ ]] || [[ "${MAX_FILE}" -lt 1 ]]; then
-  echo "Invalid --max-file '${MAX_FILE}'. Must be an integer >= 1." >&2
-  exit 1
-fi
-
-DAEMON_JSON="/etc/docker/daemon.json"
-BACKUP_DIR="/etc/docker/backup-daemon-json"
-TS="$(date +%Y%m%d-%H%M%S)"
-BACKUP_PATH="${BACKUP_DIR}/daemon.json.${TS}.bak"
-
-echo "Target config:"
-echo "  max-size = ${MAX_SIZE}"
-echo "  max-file = ${MAX_FILE}"
-echo "  daemon.json = ${DAEMON_JSON}"
-echo
-
-if [[ "${DRY_RUN}" == "1" ]]; then
-  echo "[DRY RUN] No changes will be made."
-fi
-
-mkdir -p "${BACKUP_DIR}"
-
-# Backup existing daemon.json if present
-if [[ -f "${DAEMON_JSON}" ]]; then
-  if [[ "${DRY_RUN}" == "0" ]]; then
-    cp -a "${DAEMON_JSON}" "${BACKUP_PATH}"
-  fi
-  echo "Backup: ${BACKUP_PATH}"
-else
-  echo "No existing daemon.json found; will create a new one."
-fi
-
-# Create temp file and write merged json using python (available on Debian/Ubuntu)
-TMP="$(mktemp)"
-cleanup() { rm -f "${TMP}"; }
-trap cleanup EXIT
-
-PYTHON_BIN=""
-if command -v python3 >/dev/null 2>&1; then
-  PYTHON_BIN="python3"
-elif command -v python >/dev/null 2>&1; then
-  PYTHON_BIN="python"
-else
-  echo "Python is required to safely edit JSON. Please install python3." >&2
-  exit 1
-fi
+# ── 生成 JSON ───────────────────────────────────────────────────────────────
+need_cmd python3
 
 CURRENT_JSON="{}"
-if [[ -f "${DAEMON_JSON}" ]]; then
-  # If file is empty or invalid JSON, abort safely
-  if ! "${PYTHON_BIN}" -c "import json,sys; json.load(open('${DAEMON_JSON}')); print('ok')" >/dev/null 2>&1; then
-    echo "ERROR: ${DAEMON_JSON} exists but is not valid JSON. Fix it first, or restore from backup." >&2
-    exit 1
-  fi
-  CURRENT_JSON="$(cat "${DAEMON_JSON}")"
+if [[ -f "$DAEMON_JSON" ]]; then
+    if ! python3 -c "import json,sys; json.load(open('$DAEMON_JSON'))" 2>/dev/null; then
+        echo "daemon.json 不是合法 JSON，请先修复。" >&2; exit 1
+    fi
+    CURRENT_JSON=$(cat "$DAEMON_JSON")
 fi
 
-NEW_JSON="$("${PYTHON_BIN}" - <<PY
+NEW_JSON=$(python3 - <<PY
 import json, sys
 data = json.loads(r'''$CURRENT_JSON''' or "{}")
 
-# Ensure json-file rotation settings
-# Keep existing settings, only set/override these keys.
 log_opts = data.get("log-opts", {}) if isinstance(data.get("log-opts", {}), dict) else {}
 log_opts["max-size"] = "$MAX_SIZE"
-log_opts["max-file"] = str("$MAX_FILE")  # Docker expects string values here
+log_opts["max-file"] = str("$MAX_FILE")
 data["log-opts"] = log_opts
 
-# Ensure log-driver is json-file if not explicitly set (optional).
-# If user already set something else, don't override.
 if "log-driver" not in data:
     data["log-driver"] = "json-file"
 
 print(json.dumps(data, indent=2, sort_keys=True))
 PY
-)"
+)
 
-echo "New daemon.json content:"
-echo "----------------------------------------"
-echo "${NEW_JSON}"
-echo "----------------------------------------"
-echo
+echo "新配置:"
+echo "$NEW_JSON"
 
-if [[ "${DRY_RUN}" == "0" ]]; then
-  echo "${NEW_JSON}" > "${TMP}"
-  install -m 0644 "${TMP}" "${DAEMON_JSON}"
-  echo "Written: ${DAEMON_JSON}"
+if [[ "$DRY_RUN" == 0 ]]; then
+    echo "$NEW_JSON" > "$DAEMON_JSON"
+    echo "已写入: $DAEMON_JSON"
+
+    echo "重载 Docker 配置..."
+    systemctl daemon-reload || true
+    systemctl restart docker || { echo "Docker 重启失败，请手动检查。" >&2; exit 1; }
+    systemctl is-active --quiet docker && echo "Docker 运行正常。"
 else
-  echo "[DRY RUN] Would write ${DAEMON_JSON}"
+    echo "[预览] 不会写入文件或重启 Docker。"
 fi
 
-# Restart docker to apply
-echo
-echo "Restarting Docker daemon to apply changes..."
-if [[ "${DRY_RUN}" == "0" ]]; then
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl restart docker
-  systemctl is-active --quiet docker && echo "Docker is active."
-else
-  echo "[DRY RUN] Would run: systemctl restart docker"
-fi
-
-# Optional: truncate existing huge container json logs
-if [[ "${APPLY_TRUNCATE}" == "1" ]]; then
-  echo
-  echo "WARNING: --apply-truncate will truncate existing container JSON logs to 0 bytes."
-  echo "This does NOT remove containers, but you will lose old logs."
-  echo
-  if [[ "${DRY_RUN}" == "0" ]]; then
-    # Docker container logs are usually under /var/lib/docker/containers/<id>/<id>-json.log
+# ── 截断现有日志 ───────────────────────────────────────────────────────────
+if [[ "$APPLY_TRUNCATE" == 1 ]] && [[ "$DRY_RUN" == 0 ]]; then
     LOG_DIR="/var/lib/docker/containers"
-    if [[ -d "${LOG_DIR}" ]]; then
-      find "${LOG_DIR}" -type f -name "*-json.log" -print -exec truncate -s 0 {} \;
-      echo "Truncated all *-json.log under ${LOG_DIR}."
-    else
-      echo "Directory not found: ${LOG_DIR}. Skipping truncate."
+    if [[ -d "$LOG_DIR" ]]; then
+        COUNT=$(find "$LOG_DIR" -type f -name "*-json.log" | wc -l)
+        echo "将截断 $COUNT 个日志文件..."
+        find "$LOG_DIR" -type f -name "*-json.log" -exec truncate -s 0 {} \;
+        echo "完成。重启容器后新日志轮转生效: docker restart \$(docker ps -q)"
     fi
-  else
-    echo "[DRY RUN] Would truncate: /var/lib/docker/containers/*/*-json.log"
-  fi
 fi
 
-echo
-echo "Done."
-echo "Tip: New containers will respect log rotation; for existing containers, restart them if needed:"
-echo "  docker restart <container>"
+echo "完毕。"
